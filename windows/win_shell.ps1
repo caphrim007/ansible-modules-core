@@ -56,22 +56,42 @@ Else {
     $exec_args = @("/c", $raw_command_line)
 }
 
-$proc = New-Object System.Diagnostics.Process
-$psi = $proc.StartInfo
+$psi = New-Object System.Diagnostics.ProcessStartInfo
 $psi.FileName = $exec_application
 $psi.Arguments = $exec_args
 $psi.RedirectStandardOutput = $true
 $psi.RedirectStandardError = $true
 $psi.UseShellExecute = $false
+$psi.CreateNoWindow = $true
 
 If ($chdir) {
     $psi.WorkingDirectory = $chdir
 }
 
+$proc = New-Object -TypeName System.Diagnostics.Process
+$proc.StartInfo = $psi
+
+# Creating string builders to store stdout and stderr
+$oStdOutBuilder = New-Object -TypeName System.Text.StringBuilder
+$oStdErrBuilder = New-Object -TypeName System.Text.StringBuilder
+
+# Adding event handlers for stdout and stderr
+$sScriptBlock = {
+    if (! [String]::IsNullOrEmpty($EventArgs.Data)) {
+        $Event.MessageData.AppendLine($EventArgs.Data)
+    }
+}
+$oStdOutEvent = Register-ObjectEvent -InputObject $proc `
+    -Action $sScriptBlock -EventName 'OutputDataReceived' `
+    -MessageData $oStdOutBuilder
+$oStdErrEvent = Register-ObjectEvent -InputObject $proc `
+    -Action $sScriptBlock -EventName 'ErrorDataReceived' `
+    -MessageData $oStdErrBuilder
+
 $start_datetime = [DateTime]::UtcNow
 
 Try {
-    $proc.Start() | Out-Null # will always return $true for non shell-exec cases
+    [Void]$proc.Start() # will always return $true for non shell-exec cases
 }
 Catch [System.ComponentModel.Win32Exception] {
     # fail nicely for "normal" error conditions
@@ -80,20 +100,28 @@ Catch [System.ComponentModel.Win32Exception] {
     Exit-Json @{failed=$true;changed=$false;cmd=$raw_command_line;rc=$excep.Exception.NativeErrorCode;msg=$excep.Exception.Message}
 }
 
-# TODO: resolve potential deadlock here if stderr fills buffer (~4k) before stdout is closed,
-# perhaps some async stream pumping with Process Output/ErrorDataReceived events...
+$proc.BeginOutputReadLine()
+$proc.BeginErrorReadLine()
+[Void]$proc.WaitForExit()
 
-$result.stdout = $proc.StandardOutput.ReadToEnd()
-$result.stderr = $proc.StandardError.ReadToEnd()
+# Unregistering events to retrieve process output
+Unregister-Event -SourceIdentifier $oStdOutEvent.Name
+Unregister-Event -SourceIdentifier $oStdErrEvent.Name
 
-# TODO: decode CLIXML stderr output (and other streams?)
+$oResult = New-Object -TypeName PSObject -Property ([Ordered]@{
+    "ExeFile" = $exec_application;
+    "Args" = $exec_args;
+    "ExitCode" = $proc.ExitCode;
+    "StdOut" = $oStdOutBuilder.ToString().Trim();
+    "StdErr" = $oStdErrBuilder.ToString().Trim()
+})
 
-$proc.WaitForExit() | Out-Null
-
-$result.rc = $proc.ExitCode
+$result.rc = $oResult.ExitCode
 
 $end_datetime = [DateTime]::UtcNow
 
+$result.stderr = $oResult.StdErr
+$result.stdout = $oResult.StdOut
 $result.start = $start_datetime.ToString("yyyy-MM-dd hh:mm:ss.ffffff")
 $result.end = $end_datetime.ToString("yyyy-MM-dd hh:mm:ss.ffffff")
 $result.delta = $($end_datetime - $start_datetime).ToString("h\:mm\:ss\.ffffff")
